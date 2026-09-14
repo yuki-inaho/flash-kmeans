@@ -1,0 +1,28 @@
+test notes -- how equivalence is verified
+=========================================
+Goal: prove the rewrite is functionally equivalent to the upstream Triton
+implementation, and guard the performance.
+
+Correctness:
+  tests/reference.py          pure-torch reference (euclid/cosine/dot)
+  test_equivalence_torch.py   per-dtype/mode; one-iteration assignments must
+                              match; multi-iteration runs are chaotic, so the
+                              reached objective (inertia) is compared; covers
+                              D=1..2048, odd/non-power-of-two D, empty
+                              clusters, convergence, seeded init
+  test_equivalence_triton.py  runs the upstream package in a subprocess
+                              (PYTHONPATH; editable-install hooks are removed)
+                              and compares one-iteration assignments, converged
+                              inertia + partition overlap, assignment/update in
+                              isolation and kmeans_largeN; thresholds reflect
+                              tf32/fp16 accumulation differences
+  test_golden.py + data/      frozen upstream outputs (64 KiB total, inputs
+                              regenerated from a CPU seed) so the suite works
+                              without the upstream checkout
+Performance:
+  test_perf_regression.py + perf_baselines.json -- per-GPU baselines, 1.3x
+  tolerance, opt-in via FLASH_KMEANS_PERF=1; refreshed with
+  `pixi run -e equiv bench-update`
+
+Validation status on RTX 5090: 79 passed, 3 skipped (perf opt-in); both the
+WMMA and the FK_DISABLE_WMMA=1 SIMT paths pass the equivalence suites.
