@@ -34,12 +34,30 @@ from flash_kmeans import (
     triton_centroid_update_sorted_euclid,
 )
 
-REF_REPO = Path(
-    os.environ.get(
-        "FLASH_KMEANS_REF_REPO",
-        Path(__file__).resolve().parents[2] / "flash-kmeans",
-    )
-)
+def _is_triton_reference(path: Path) -> bool:
+    """True when the checkout really contains the upstream Triton kernels."""
+    f = path / "flash_kmeans" / "assign_euclid_triton.py"
+    try:
+        return f.exists() and "import triton" in f.read_text()
+    except OSError:
+        return False
+
+
+def _resolve_reference() -> Path:
+    env = os.environ.get("FLASH_KMEANS_REF_REPO")
+    if env:
+        return Path(env)
+    desktop = Path(__file__).resolve().parents[2]
+    # ``flash-kmeans`` itself was rewritten, so prefer dedicated upstream
+    # checkouts (see the README for how to create one).
+    for name in ("flash-kmeans-upstream", "flash-kmeans-original", "flash-kmeans"):
+        candidate = desktop / name
+        if _is_triton_reference(candidate):
+            return candidate
+    return desktop / "flash-kmeans"
+
+
+REF_REPO = _resolve_reference()
 RUNNER = Path(__file__).resolve().parent / "_triton_ref_runner.py"
 
 pytestmark = pytest.mark.skipif(
@@ -48,7 +66,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _reference_available() -> bool:
-    return (REF_REPO / "flash_kmeans" / "kmeans_triton_impl.py").exists()
+    return _is_triton_reference(REF_REPO)
 
 
 needs_reference = pytest.mark.skipif(
@@ -157,10 +175,16 @@ def test_centroid_update_matches_triton(tmp_path):
 @needs_reference
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_large_n_matches_triton(tmp_path, dtype):
+    # Well-separated blobs keep the two implementations on the same optimum;
+    # uniform random data makes multi-iteration k-means chaotic and the
+    # comparison meaningless (see the comments in test_equivalence_torch).
     N, D, K = 200_000, 64, 128
     g = torch.Generator().manual_seed(0)
-    x_cpu = torch.randn(N, D, generator=g).to(dtype).pin_memory()
-    init = torch.randn(K, D, device="cuda", dtype=dtype)
+    centers = (torch.randn(K, D, generator=g) * 8.0).to(dtype)
+    blob = torch.randint(0, K, (N,), generator=g)
+    x_cpu = (centers[blob].float() + torch.randn(N, D, generator=g) * 0.1)
+    x_cpu = x_cpu.to(dtype).pin_memory()
+    init = centers.to(device="cuda")
     ref = run_reference(
         tmp_path,
         {

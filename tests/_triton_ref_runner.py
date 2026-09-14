@@ -7,6 +7,7 @@ Triton-based reference, not to the C++ rewrite under test.
 
 from __future__ import annotations
 
+import pathlib
 import sys
 
 import torch
@@ -25,8 +26,11 @@ sys.meta_path = [
 
 import flash_kmeans as fk  # noqa: E402  (must come after subprocess path setup)
 
-if "flash-kmeans-cpp" in fk.__file__:
-    raise RuntimeError(f"resolved the rewrite instead of the reference: {fk.__file__}")
+_ref_dir = pathlib.Path(fk.__file__).resolve().parent
+if "import triton" not in (_ref_dir / "assign_euclid_triton.py").read_text():
+    raise RuntimeError(
+        f"resolved a checkout without the Triton kernels: {fk.__file__}"
+    )
 
 inputs = torch.load(inputs_path, map_location="cuda")
 x = inputs["x"]
