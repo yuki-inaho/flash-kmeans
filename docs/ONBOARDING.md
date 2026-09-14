@@ -30,8 +30,9 @@
   - 空クラスタは旧 centroid を維持、cosine/dot は更新後に再正規化、累積和は fp32。
 - **機能同等性は元 Triton 実装との比較で担保する。** 多反復 k-means はカオス的にずれるため、
   主判定は inertia（目的関数）の相対差 ≤1e-3 とし、ラベル一致率は sanity 閾値（≥0.8〜0.99）で見る。
-- **カーネル変更時は WMMA / SIMT 両経路のテストを通す。** `FK_DISABLE_WMMA=1` で SIMT 強制。
+- **カーネル変更時は MMA / WMMA / SIMT 全経路のテストを通す。** `FK_DISABLE_MMA=1` / `FK_DISABLE_WMMA=1` で下位経路を強制。
 - **性能回帰はベースラインで担保。** `tests/perf_baselines.json`（GPU名キー, 許容1.3x）。更新は該当GPU実機で行う。
+- **largeN は独自ストリームで動く。** 呼び出し前に `torch.cuda.synchronize()` で呼び出し側ストリームと同期する（`ops.py` 実装済み）。これを外すと、生成直後の CUDA テンソルを読み損ねて断続的に壊れる（過去に実際に踏んだ）。
 - **数値の取り扱い:** fp32 atomic 加算の順序は非決定 → 同一シードでも runs 間で fp32 丸めレベルの差があり得る（仕様）。
 - 乱数は C++ 実装（splitmix64）であり、元実装の `torch.randint` とビット一致しない（シード再現性は本実装内で担保）。
 
@@ -42,7 +43,8 @@
 | 利用手順・性能 | `README.md` | ビルド、API、対応HW/dtype、性能表、プロファイリング |
 | 公開 C++ API | `src/flash_kmeans.h` | `batch_kmeans` / `euclid_assign` / `centroid_update` / `kmeans_large_n[_assign]` |
 | カーネル | `src/kmeans_common.cuh` | assign（レジスタ/共有メモリ/グローバル）, row_sq, normalize, rng_gather, accumulate, finalize |
-| Tensor Core | `src/assign_wmma.cuh` | WMMA 経路（fp16/bf16, D%16==0, sm_80+, 共有メモリ予算内） |
+| Tensor Core (mma) | `src/assign_mma.cuh` | 手書き `mma.m16n8k16` + レジスタ argmin + cp.async（fp16/bf16, D∈{32,64,128,256,512}, sm_80+）。最速経路 |
+| Tensor Core (WMMA) | `src/assign_wmma.cuh` | WMMA 経路（fp16/bf16, D%16==0, sm_80+, 共有メモリ予算内）。mma 非対応次元用 |
 | 起動構成 | `src/kmeans_launch.cuh` | デバイス共有メモリ量に基づくカーネル/タイル選択 |
 | バッチループ | `src/kmeans_impl.cu` | euclid/cosine/dot 反復、収束判定、per-phase プロファイラ |
 | 大N | `src/large_n.cu` | CPU→GPU チャンクストリーミング、マルチGPU gather-reduce-broadcast |
@@ -159,14 +161,17 @@ docs/                  本ドキュメント
 
 | 項目 | ms | TFLOP/s |
 |------|----:|--------:|
-| バッチ（5反復平均/反復） | 15.2 | 40.0 |
-| assign D=128（WMMA） | 15.6 | 38.9 |
-| assign D=256（WMMA） | 35.1 | 34.6 |
-| assign D=512（SIMT） | 217.7 | 11.2 |
+| バッチ（5反復平均/反復） | 4.6 | 130 |
+| assign D=64（mma） | 3.3 | 93 |
+| assign D=128（mma） | 4.7 | 129 |
+| assign D=256（mma） | 9.0 | 136 |
+| assign D=512（mma） | 21.8 | 112 |
 | 参考: 元 Triton | 7.7 | 79.3 |
 
-- 残課題（高速化）: WMMA エピローグのレジスタ内 argmin 化（共有メモリのスクラッチ往復削減）、
-  D=512 向けの BN 適応または `mma.sync` 手書き実装。
+- D>512 は汎用カーネルへフォールバックし大幅に低速（D=1024 で約0.6 TFLOP/s）。
+  改良するなら mma カーネルの A オペランドを D 方向にストリーム化（ldmatrix 化）する。
+
+- 残課題（高速化）: D>512 の mma 対応（A オペランドの D ストリーミング / ldmatrix 化）。
 - 残課題（検証）: マルチGPU largeN（本機は1GPUのため未検証）、sm_61/75/86/89 実機検証、他GPUの perf ベースライン追加。
 
 > 本書は 2026-09-14 時点の `main`（`e922416`）に基づく。コマンドはすべて実機で確認済み。

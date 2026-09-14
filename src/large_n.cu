@@ -4,11 +4,14 @@
 // original Python implementation.
 #include "flash_kmeans.h"
 #include "kmeans_common.cuh"
+#include "assign_mma.cuh"
+#include "assign_wmma.cuh"
 #include "kmeans_launch.cuh"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -265,10 +268,17 @@ void large_n_typed(const void* x_cpu, const void* init_centroids,
             launch_row_sq<T>(d.cbuf[flag].as<T>(),
                              d.xsq[0].as<float>() + local_off, n_this, (int)D, ws);
           }
-          launch_assign_dispatch<T>(
+          const bool used_mma = launch_assign_mma<T>(
               d.cbuf[flag].as<T>(), d.xsq[0].as<float>() + local_off,
-              d.cent_f32.as<float>(), d.csq.as<float>(), /*B=*/1, n_this, D, K,
+              d.cent.as<T>(), d.csq.as<float>(), /*B=*/1, n_this, D, K,
               /*maximize=*/false, d.labels.as<int>() + local_off, d.ordinal, ws);
+          if (!used_mma) {
+            launch_assign_dispatch<T>(
+                d.cbuf[flag].as<T>(), d.xsq[0].as<float>() + local_off,
+                d.cent_f32.as<float>(), d.csq.as<float>(), /*B=*/1, n_this, D,
+                K, /*maximize=*/false, d.labels.as<int>() + local_off,
+                d.ordinal, ws);
+          }
           launch_accumulate<T>(d.cbuf[flag].as<T>(),
                                d.labels.as<int>() + local_off, d.sums.as<float>(),
                                d.cnts.as<int>(), n_this, n_this, D, K, ws);
@@ -479,10 +489,17 @@ void large_n_assign_typed(const void* x_cpu, const void* centroids,
             (std::size_t)n_this * D * esize, cudaMemcpyHostToDevice, ws));
         launch_row_sq<T>(d.cbuf[flag].as<T>(), d.xsq[flag].as<float>(), n_this,
                          (int)D, ws);
-        launch_assign_dispatch<T>(
-            d.cbuf[flag].as<T>(), d.xsq[flag].as<float>(),
-            d.cent_f32.as<float>(), d.csq.as<float>(), /*B=*/1, n_this, D, K,
-            /*maximize=*/false, d.labels.as<int>() + local_off, d.ordinal, ws);
+        const bool used_mma = launch_assign_mma<T>(
+            d.cbuf[flag].as<T>(), d.xsq[flag].as<float>(), d.cent.as<T>(),
+            d.csq.as<float>(), /*B=*/1, n_this, D, K, /*maximize=*/false,
+            d.labels.as<int>() + local_off, d.ordinal, ws);
+        if (!used_mma) {
+          launch_assign_dispatch<T>(
+              d.cbuf[flag].as<T>(), d.xsq[flag].as<float>(),
+              d.cent_f32.as<float>(), d.csq.as<float>(), /*B=*/1, n_this, D, K,
+              /*maximize=*/false, d.labels.as<int>() + local_off, d.ordinal,
+              ws);
+        }
       }
       FK_CHECK(cudaEventRecord(d.ev_work_done[0], d.work[0]));
       FK_CHECK(cudaEventRecord(d.ev_work_done[1], d.work[1]));

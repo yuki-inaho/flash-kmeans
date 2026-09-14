@@ -137,6 +137,17 @@ def test_assignment_dimension_coverage(D):
     assert agree >= 0.995, f"D={D}: label agreement {agree}"
 
 
+@pytest.mark.parametrize("D", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mma_dimensions_match_reference(D, dtype):
+    """The tensor-core (MMA) path covers D in {32, 64, 128, 256, 512}."""
+    B, N, K = 2, 3000, 48
+    x, init = make_inputs(B, N, D, K, dtype, seed=D)
+    labels, cent, _ = batch_kmeans_Euclid(x, K, max_iters=1, init_centroids=init)
+    rlabels, rcent, _ = ref_kmeans(x, K, max_iters=1, init_centroids=init)
+    check_equal(labels, cent, rlabels, rcent, dtype)
+
+
 @pytest.mark.parametrize("D", [8, 64, 513, 2048])
 def test_batch_kmeans_dimension_coverage(D):
     B, N, K = 2, 1500, 20

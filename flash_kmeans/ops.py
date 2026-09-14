@@ -352,6 +352,11 @@ def kmeans_largeN(
         raise ValueError("kmeans_largeN expects x to be on the CPU")
     if x.dim() != 2:
         raise ValueError("kmeans_largeN expects x with shape (N, D)")
+    # The C++ streaming pipeline runs on its own CUDA streams; make sure every
+    # previously enqueued kernel (e.g. the caller's recent device tensors) has
+    # finished before the pipeline reads any tensor memory.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     dtype = dtype or x.dtype
     _code(dtype)
     x = x.to(dtype)
@@ -413,6 +418,10 @@ def kmeans_largeN_assign(
         raise ValueError("kmeans_largeN_assign expects x to be on the CPU")
     if x.dim() != 2:
         raise ValueError("kmeans_largeN_assign expects x with shape (N, D)")
+    # See kmeans_largeN: the C++ pipeline uses its own streams, so synchronize
+    # with the caller's stream before it reads tensor memory.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     dtype = dtype or x.dtype
     _code(dtype)
     x = x.to(dtype)
