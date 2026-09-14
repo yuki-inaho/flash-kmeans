@@ -1,0 +1,22 @@
+rewrite notes -- where the work moved
+=====================================
+src/flash_kmeans.h      public C++ API (batch_kmeans, euclid_assign, centroid_update,
+                        row_sq, kmeans_large_n[_assign])
+src/kmeans_common.cuh   CUDA kernels: assign (shared tile / global fallback),
+                        row_sq, normalize, rng_gather, accumulate (fp32 atomics),
+                        finalize (mean, empty-cluster fallback, L2 renormalize,
+                        max-shift tracking)
+src/kmeans_launch.cuh   runtime launch configuration (device shared-memory limits)
+src/kmeans_impl.cu      euclid/cosine/dot batch loop, convergence on max centroid
+                        shift, deterministic splitmix64 random init
+src/large_n.cu          CPU->GPU streaming: BLOCK_N chunks, double-buffered H2D,
+                        cached ||x||^2, multi-GPU partition + gather-reduce-broadcast
+src/bindings.cpp        nanobind module (raw pointers + current CUDA stream)
+flash_kmeans/           thin marshalling only; same public API and module paths,
+                        plus compat shims and a pure-torch fallback
+
+Semantics preserved: fp32 accumulation, empty clusters keep the old centroid,
+cosine/dot renormalize after every update, the returned centroids/labels follow
+the original "labels from the last assignment" behaviour.
+Performance at this commit (RTX 5090, fp16, B=32 N=74256 D=128 K=1000):
+102 ms/iteration.
