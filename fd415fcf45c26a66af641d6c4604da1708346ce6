@@ -1,0 +1,13 @@
+build/packaging notes
+=====================
+Environments (pixi):
+  default : python 3.12, cmake>=3.28, ninja, cuda-nvcc/cudart/cudart-dev/cccl 12.8,
+            nanobind>=2.0, scikit-build-core>=0.10  (torch-free; builds the extension)
+  equiv   : default + optional test deps: torch>=2.7 (cu128 index), triton>=3.3,
+            numpy, pytest, tqdm
+Tasks (equiv feature): test, test-equiv, bench, bench-update, perf
+Extension: stable-ABI nanobind module installed into flash_kmeans/ as
+           _flash_kmeans_cpp via scikit-build-core + CMake.
+CUDA targets: 61-real;75-real;86-real;89-real;120-real;120-virtual
+              (GTX 1070 / Turing / Ampere / RTX 4090 / RTX 5090 + PTX);
+              override with CUDAARCHS=...
