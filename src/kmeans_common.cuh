@@ -254,20 +254,21 @@ __global__ void assign_kernel(const T* __restrict__ x,
   labels[(std::size_t)b * n + n_idx] = best_k;
 }
 
-// Specialised variant for small compile-time feature dimensions: the x row is
-// kept in fp32 registers, shared by SPLIT consecutive lanes of a warp, and the
-// centroid rows are streamed through a shared-memory tile so the K loop runs
-// from shared memory instead of L2.
-template <typename T, int D_COMPILE, int SPLIT, int BK, bool MAXIMIZE>
+// Specialised variant for small feature dimensions: the x row is kept in
+// fp32 registers, shared by SPLIT consecutive lanes of a warp, and centroid
+// rows are streamed through a padded shared-memory tile.  The feature
+// dimension is a runtime value; rows shorter than the compile-time padded
+// width are zero-filled (x padding zeros do not contribute to the dot
+// product, so the centroid padding does not need to be initialised).
+template <typename T, int DSEG, int SPLIT, int BK, bool MAXIMIZE>
 __global__ void assign_kernel_reg(const T* __restrict__ x,
                                   const float* __restrict__ xsq,
                                   const float* __restrict__ cent,
-                                  const float* __restrict__ csq, int n, int k,
-                                  int* __restrict__ labels) {
-  constexpr int D = D_COMPILE;
-  constexpr int DSEG = D / SPLIT;
+                                  const float* __restrict__ csq, int n, int d,
+                                  int k, int* __restrict__ labels) {
+  constexpr int DPAD = DSEG * SPLIT;
+  constexpr int SEG_STRIDE = (SPLIT == 1) ? DSEG : (DSEG + 4);
   static_assert(DSEG == 32 || DSEG == 64, "unsupported register tile");
-  static_assert(D % 4 == 0, "float4 loads require D % 4 == 0");
   extern __shared__ float s_ctile[];
 
   const int seg = threadIdx.x % SPLIT;
@@ -276,55 +277,72 @@ __global__ void assign_kernel_reg(const T* __restrict__ x,
   const int p = blockIdx.x * points_per_block + threadIdx.x / SPLIT;
   const int p_safe = (p < n) ? p : (n - 1);  // keep all lanes active for shfl
 
-  const T* xrow = x + ((std::size_t)b * n + p_safe) * D + seg * DSEG;
+  const int base = seg * DSEG;
+  const T* xrow = x + ((std::size_t)b * n + p_safe) * d + base;
   float xr[DSEG];
+  // 16-byte vector loads need the row offset (p * d) to keep that alignment:
+  // 4 elements for fp32, 8 elements for 2-byte types.
+  const bool row_vec_ok =
+      (sizeof(T) == 4) ? ((d & 3) == 0) : ((d & 7) == 0);
+  if (row_vec_ok && base + DSEG <= d) {
 #pragma unroll
-  for (int i = 0; i < DSEG; i += 8) {
-    if constexpr (std::is_same<T, float>::value) {
-      const float4 lo = *reinterpret_cast<const float4*>(xrow + i);
-      const float4 hi = *reinterpret_cast<const float4*>(xrow + i + 4);
-      xr[i] = lo.x; xr[i + 1] = lo.y; xr[i + 2] = lo.z; xr[i + 3] = lo.w;
-      xr[i + 4] = hi.x; xr[i + 5] = hi.y; xr[i + 6] = hi.z; xr[i + 7] = hi.w;
-    } else {
-      using V2 = typename TypeTraits<T>::Vec2;
-      const uint4 q = *reinterpret_cast<const uint4*>(xrow + i);  // 8 elements
-      const float2 f0 = to_float2(*reinterpret_cast<const V2*>(&q.x));
-      const float2 f1 = to_float2(*reinterpret_cast<const V2*>(&q.y));
-      const float2 f2 = to_float2(*reinterpret_cast<const V2*>(&q.z));
-      const float2 f3 = to_float2(*reinterpret_cast<const V2*>(&q.w));
-      xr[i] = f0.x; xr[i + 1] = f0.y;
-      xr[i + 2] = f1.x; xr[i + 3] = f1.y;
-      xr[i + 4] = f2.x; xr[i + 5] = f2.y;
-      xr[i + 6] = f3.x; xr[i + 7] = f3.y;
+    for (int i = 0; i < DSEG; i += 8) {
+      if constexpr (std::is_same<T, float>::value) {
+        const float4 lo = *reinterpret_cast<const float4*>(xrow + i);
+        const float4 hi = *reinterpret_cast<const float4*>(xrow + i + 4);
+        xr[i] = lo.x; xr[i + 1] = lo.y; xr[i + 2] = lo.z; xr[i + 3] = lo.w;
+        xr[i + 4] = hi.x; xr[i + 5] = hi.y; xr[i + 6] = hi.z; xr[i + 7] = hi.w;
+      } else {
+        using V2 = typename TypeTraits<T>::Vec2;
+        const uint4 q = *reinterpret_cast<const uint4*>(xrow + i);  // 8 elements
+        const float2 f0 = to_float2(*reinterpret_cast<const V2*>(&q.x));
+        const float2 f1 = to_float2(*reinterpret_cast<const V2*>(&q.y));
+        const float2 f2 = to_float2(*reinterpret_cast<const V2*>(&q.z));
+        const float2 f3 = to_float2(*reinterpret_cast<const V2*>(&q.w));
+        xr[i] = f0.x; xr[i + 1] = f0.y;
+        xr[i + 2] = f1.x; xr[i + 3] = f1.y;
+        xr[i + 4] = f2.x; xr[i + 5] = f2.y;
+        xr[i + 6] = f3.x; xr[i + 7] = f3.y;
+      }
+    }
+  } else {
+#pragma unroll
+    for (int j = 0; j < DSEG; ++j) {
+      xr[j] = (base + j < d) ? to_float(xrow[j]) : 0.f;
     }
   }
 
   const float x2 = xsq ? xsq[(std::size_t)b * n + p_safe] : 0.f;
-  const float* cbase = cent + ((std::size_t)b * k) * D;
+  const float* cbase = cent + ((std::size_t)b * k) * d;
   float best = MAXIMIZE ? -FLT_MAX : FLT_MAX;
   int best_k = 0;
 
-  // With SPLIT > 1 each segment is padded by four words so that the lanes of
-  // a point read different shared-memory banks (a power-of-two DSEG would
-  // otherwise map every segment onto the same bank).  SPLIT == 1 keeps the
-  // contiguous layout and vectorised copies.
-  constexpr int SEG_STRIDE = (SPLIT == 1) ? DSEG : (DSEG + 4);
   for (int k0 = 0; k0 < k; k0 += BK) {
     const int kcount = (k0 + BK <= k) ? BK : (k - k0);
     if constexpr (SPLIT == 1) {
-      const float4* __restrict__ g4 =
-          reinterpret_cast<const float4*>(cbase + (std::size_t)k0 * D);
-      float4* s4 = reinterpret_cast<float4*>(s_ctile);
-      const int n4 = kcount * (D / 4);
-      for (int i = threadIdx.x; i < n4; i += blockDim.x) s4[i] = g4[i];
+      if (d == DSEG) {
+        const float4* __restrict__ g4 =
+            reinterpret_cast<const float4*>(cbase + (std::size_t)k0 * d);
+        float4* s4 = reinterpret_cast<float4*>(s_ctile);
+        const int n4 = kcount * (DSEG / 4);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) s4[i] = g4[i];
+      } else {
+        for (int idx = threadIdx.x; idx < kcount * DPAD; idx += blockDim.x) {
+          const int kk = idx / DPAD;
+          const int j = idx - kk * DPAD;
+          s_ctile[kk * DSEG + j] =
+              (j < d) ? cbase[(std::size_t)(k0 + kk) * d + j] : 0.f;
+        }
+      }
     } else {
-      const float* __restrict__ gbase = cbase + (std::size_t)k0 * D;
-      const int n = kcount * D;
-      for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const int kk = i / D;
-        const int d = i - kk * D;
-        const int sg = d / DSEG;
-        s_ctile[(kk * SPLIT + sg) * SEG_STRIDE + (d - sg * DSEG)] = gbase[i];
+      for (int idx = threadIdx.x; idx < kcount * DPAD; idx += blockDim.x) {
+        const int kk = idx / DPAD;
+        const int r = idx - kk * DPAD;
+        const int sg = r / DSEG;
+        const int j = r - sg * DSEG;
+        const int gd = sg * DSEG + j;
+        s_ctile[(kk * SPLIT + sg) * SEG_STRIDE + j] =
+            (gd < d) ? cbase[(std::size_t)(k0 + kk) * d + gd] : 0.f;
       }
     }
     __syncthreads();
@@ -450,6 +468,10 @@ __global__ void rng_gather_kernel(const T* __restrict__ x, T* __restrict__ out,
 // centroid accumulation (atomic, fp32 accumulation buffer)
 // ---------------------------------------------------------------------------
 
+// Each warp accumulates one point per iteration: the lanes split the feature
+// dimension so a warp's atomic additions target consecutive addresses, which
+// keeps the L2 atomic traffic coalesced (the per-thread variant scatters one
+// 16-byte update per point across K rows).
 template <typename T, bool VEC>
 __global__ void accumulate_kernel(const T* __restrict__ x,
                                   const int* __restrict__ labels,
@@ -457,25 +479,29 @@ __global__ void accumulate_kernel(const T* __restrict__ x,
                                   int* __restrict__ counts,
                                   std::int64_t total, int n, int d,
                                   std::int64_t k) {
-  const std::int64_t stride = (std::int64_t)gridDim.x * blockDim.x;
-  for (std::int64_t i = (std::int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-       i < total; i += stride) {
+  const int lane = threadIdx.x & 31;
+  const std::int64_t warp_id =
+      ((std::int64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const std::int64_t nwarps = ((std::int64_t)gridDim.x * blockDim.x) >> 5;
+  const bool vec = VEC && ((d & 3) == 0);
+
+  for (std::int64_t i = warp_id; i < total; i += nwarps) {
     const int lab = labels[i];
     const std::int64_t b = i / n;
     const T* row = x + i * d;
     float* dst = sums + (b * k + lab) * d;
-
+    if (lane == 0) atomicAdd(&counts[b * k + lab], 1);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    if (VEC && (d & 3) == 0) {
-      for (int dd = 0; dd < d; dd += 4) {
+    if (vec) {
+      for (int dd = lane * 4; dd < d; dd += 128) {
         atomicAdd(reinterpret_cast<float4*>(dst + dd), load4<T>(row + dd));
       }
-      atomicAdd(&counts[b * k + lab], 1);
       continue;
     }
 #endif
-    for (int dd = 0; dd < d; ++dd) atomicAdd(&dst[dd], to_float(row[dd]));
-    atomicAdd(&counts[b * k + lab], 1);
+    for (int dd = lane; dd < d; dd += 32) {
+      atomicAdd(&dst[dd], to_float(row[dd]));
+    }
   }
 }
 

@@ -73,21 +73,23 @@ inline void launch_assign(const T* x, const float* xsq, const float* cent,
   }
 }
 
-// Compile-time D specialisations that keep the x row in fp32 registers
-// (shared by SPLIT lanes per point) and stream centroid tiles through shared
-// memory.
-template <typename T, int Dc, int Split, int Bk, bool Max>
+// Compile-time (DSEG, SPLIT) specialisations that keep the x row in fp32
+// registers and stream centroid tiles through shared memory.  The runtime
+// feature dimension d is zero-padded up to DSEG * SPLIT.
+template <typename T, int Dseg, int Split, int Bk, bool Max>
 inline void launch_reg_case(const T* x, const float* xsq, const float* cent,
                             const float* csq, std::int64_t B, std::int64_t N,
-                            std::int64_t K, int* labels, cudaStream_t st) {
+                            std::int64_t D, std::int64_t K, int* labels,
+                            cudaStream_t st) {
   const int bn = 128;
   const int points_per_block = bn / Split;
   const dim3 grid((unsigned)((N + points_per_block - 1) / points_per_block),
                   (unsigned)B);
-  constexpr int kSegStride = (Split == 1) ? (Dc / Split) : ((Dc / Split) + 4);
+  constexpr int kSegStride = (Split == 1) ? Dseg : (Dseg + 4);
   const std::size_t smem = (std::size_t)Bk * Split * kSegStride * sizeof(float);
-  assign_kernel_reg<T, Dc, Split, Bk, Max>
-      <<<grid, bn, smem, st>>>(x, xsq, cent, csq, (int)N, (int)K, labels);
+  assign_kernel_reg<T, Dseg, Split, Bk, Max>
+      <<<grid, bn, smem, st>>>(x, xsq, cent, csq, (int)N, (int)D, (int)K,
+                               labels);
 }
 
 template <typename T>
@@ -96,25 +98,23 @@ inline bool launch_assign_reg(const T* x, const float* xsq, const float* cent,
                               std::int64_t D, std::int64_t K, bool maximize,
                               int* labels, cudaStream_t st) {
   constexpr std::int64_t kIntMax = 2147483647;
-  if (N > kIntMax || K > kIntMax) return false;
-#define FK_REG_CASE(Dc, Split, Bk)                                            \
+  if (N > kIntMax || K > kIntMax || D <= 0) return false;
+#define FK_REG_CASE(Dseg, Split, Bk)                                          \
   do {                                                                        \
     if (maximize)                                                             \
-      launch_reg_case<T, Dc, Split, Bk, true>(x, xsq, cent, csq, B, N, K,     \
-                                              labels, st);                    \
+      launch_reg_case<T, Dseg, Split, Bk, true>(x, xsq, cent, csq, B, N, D,   \
+                                                K, labels, st);               \
     else                                                                      \
-      launch_reg_case<T, Dc, Split, Bk, false>(x, xsq, cent, csq, B, N, K,    \
-                                               labels, st);                   \
+      launch_reg_case<T, Dseg, Split, Bk, false>(x, xsq, cent, csq, B, N, D,  \
+                                                 K, labels, st);              \
     return true;                                                              \
   } while (0)
-  switch (D) {
-    case 32: FK_REG_CASE(32, 1, 32);
-    case 64: FK_REG_CASE(64, 1, 32);
-    case 128: FK_REG_CASE(128, 2, 32);
-    case 256: FK_REG_CASE(256, 4, 16);
-    case 512: FK_REG_CASE(512, 8, 8);
-    default: return false;
-  }
+  if (D <= 32) FK_REG_CASE(32, 1, 32);
+  if (D <= 64) FK_REG_CASE(64, 1, 32);
+  if (D <= 128) FK_REG_CASE(64, 2, 32);
+  if (D <= 256) FK_REG_CASE(64, 4, 16);
+  if (D <= 512) FK_REG_CASE(64, 8, 8);
+  return false;
 #undef FK_REG_CASE
 }
 

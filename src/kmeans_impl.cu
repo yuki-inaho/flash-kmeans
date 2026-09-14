@@ -2,6 +2,7 @@
 // centroid-update entry points.
 #include "flash_kmeans.h"
 #include "kmeans_common.cuh"
+#include "assign_wmma.cuh"
 #include "kmeans_launch.cuh"
 
 #include <algorithm>
@@ -150,15 +151,20 @@ int batch_kmeans_typed(const T* x, const T* init_centroids, int* out_labels,
 
     prof.start(st);
     if (!maximize) {
-      launch_row_sq<float>(cent_f32.as<float>(), csq.as<float>(), rows_c, (int)D,
-                           st);
+      launch_row_sq<T>(cur.as<T>(), csq.as<float>(), rows_c, (int)D, st);
     }
     prof.t_csq += prof.stop(st);
 
     prof.start(st);
-    launch_assign_dispatch<T>(xsrc, xsq.as<float>(), cent_f32.as<float>(),
-                              csq.as<float>(), B, N, D, K, maximize, out_labels,
-                              device, st);
+    const bool used_wmma = launch_assign_wmma<T>(
+        xsrc, xsq.as<float>(), cur.as<T>(), csq.as<float>(), B, N, D, K,
+        maximize, out_labels, device, st);
+    if (!used_wmma) {
+      launch_to_fp32<T>(cur.as<T>(), cent_f32.as<float>(), rows_c * D, st);
+      launch_assign_dispatch<T>(xsrc, xsq.as<float>(), cent_f32.as<float>(),
+                                csq.as<float>(), B, N, D, K, maximize,
+                                out_labels, device, st);
+    }
     prof.t_assign += prof.stop(st);
 
     prof.start(st);
@@ -213,17 +219,23 @@ void assign_typed(const T* x, const T* centroids, int* out_labels, std::int64_t 
                   int device, cudaStream_t st) {
   const bool maximize = (mode != kEuclid);
   DeviceAlloc xsq, csq;
-  DeviceAlloc cent_f32((std::size_t)B * K * D * sizeof(float));
-  launch_to_fp32<T>(centroids, cent_f32.as<float>(), (std::size_t)B * K * D, st);
   if (!maximize) {
     xsq = DeviceAlloc((std::size_t)B * N * sizeof(float));
     launch_row_sq<T>(x, xsq.as<float>(), B * N, (int)D, st);
     csq = DeviceAlloc((std::size_t)B * K * sizeof(float));
-    launch_row_sq<float>(cent_f32.as<float>(), csq.as<float>(), B * K, (int)D, st);
+    launch_row_sq<T>(centroids, csq.as<float>(), B * K, (int)D, st);
   }
-  launch_assign_dispatch<T>(x, xsq.as<float>(), cent_f32.as<float>(),
-                            csq.as<float>(), B, N, D, K, maximize, out_labels,
-                            device, st);
+  const bool used_wmma = launch_assign_wmma<T>(
+      x, xsq.as<float>(), centroids, csq.as<float>(), B, N, D, K, maximize,
+      out_labels, device, st);
+  if (!used_wmma) {
+    DeviceAlloc cent_f32((std::size_t)B * K * D * sizeof(float));
+    launch_to_fp32<T>(centroids, cent_f32.as<float>(), (std::size_t)B * K * D,
+                      st);
+    launch_assign_dispatch<T>(x, xsq.as<float>(), cent_f32.as<float>(),
+                              csq.as<float>(), B, N, D, K, maximize,
+                              out_labels, device, st);
+  }
 }
 
 }  // namespace
