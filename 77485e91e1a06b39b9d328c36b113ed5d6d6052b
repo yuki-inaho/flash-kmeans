@@ -1,0 +1,38 @@
+optimization notes -- profile-driven, measured on RTX 5090
+==========================================================
+Profiling first: FLASH_KMEANS_PROFILE=1 records CUDA events per phase inside the
+C++ batch loop.  Before optimization: assign 96.8%, accumulate 3.0%, everything
+else < 0.2% of a 48 ms/iteration (fp16 D=128 K=1000).
+
+1) assign, shared-memory centroid tiling  (102 -> 19.4 ms/iteration)
+   Before: each warp streamed the full K x D centroid matrix from L2, so the
+   fp16 D=128 case was latency-bound at 17% occupancy.
+   Now:    a thread block stages centroid tiles in shared memory; each lane
+   group reads its zero-padded segment.  Segment stride DSEG+4 words keeps the
+   16-byte alignment needed for float4 reads AND maps the SPLIT lanes of a
+   point to different banks (the padding removed a 2-8x bank conflict that
+   showed up as D=256/512 being 8-12x slower than D=64).
+   x rows live in fp32 registers shared by SPLIT lanes per point.
+
+2) generic feature dimensions  (zero padding)
+   The register kernel now takes a runtime d and zero-pads rows up to a
+   compile-time DSEG*SPLIT width, so every D <= 512 uses the fast path
+   (odd/non-power-of-two included).  Fixed a latent alignment bug found here:
+   16-byte vector loads of 2-byte rows require d % 8 == 0, not d % 4 == 0.
+
+3) accumulate  (1.43 -> 0.57 ms)
+   One warp per point with lane-strided float4 atomicAdd: a warp's updates now
+   target consecutive addresses (4-8x fewer L2 transactions) instead of one
+   thread scattering 16-byte updates across K rows.
+
+4) tensor cores (WMMA) for fp16/bf16, D % 16 == 0, sm_80+, smem budget fits
+   64-point x tile + double-buffered 32-centroid tiles in shared memory; each
+   warp computes a 16x32 strip with mma.m16n16k16 (fp32 accumulation) and the
+   epilogue converts dots to ||x-c||^2 and updates the running argmin.
+   Dispatch: D >= 128 (where it beats SIMT: 1.37x at D=128, 2.04x at D=256).
+   FK_DISABLE_WMMA=1 forces the SIMT path (used by the equivalence tests).
+
+Final performance (fp16, B=32 N=74256 K=1000, RTX 5090):
+  batch      15.2 ms/iteration (40.0 TFLOP/s)
+  assign D=32/64/128/256/512: 4.8 / 7.9 / 15.6 / 35.1 / 217.7 ms
+  original Triton reference:  7.7 ms/iteration (79.3 TFLOP/s)
