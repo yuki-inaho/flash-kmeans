@@ -1,0 +1,25 @@
+fix notes -- large-N cross-stream race
+======================================
+Symptom: kmeans_largeN / kmeans_largeN_assign returned garbage in ~10-30% of
+the calls when the input was split into three or more chunks (few unique
+labels, many empty clusters, sometimes NaN centroids; a following batch call
+in the same process could also come out wrong).
+
+Root cause: the C++ pipeline runs on its own CUDA streams (work[0], work[1],
+reduce) while the tensors it reads (x, init_centroids, centroids) were
+produced by the caller on the caller's stream (torch's current stream).
+Nothing ordered `randn`/`to()`/etc. against the pipeline, so the D2D/H2D
+copies could read a tensor before the producer kernel had written it.
+Calls with a single chunk happened to be timed such that the producer had
+finished; multi-chunk calls changed the timing enough to expose it.
+
+Fix: flash_kmeans/ops.py synchronizes the device before entering either
+large-N entry point.  Outputs were already safe (the pipeline synchronizes
+its own streams before returning).
+
+Verification: the previous reproducer (N=100000, BLOCK_N=32768, fp32 and
+fp16, random init, repeated) went from 1-4 failures per 10 calls to 0/10 in
+three consecutive runs; the blob-based equivalence test is now stable.
+The race could also be closed inside the C++ layer by importing the caller's
+stream and waiting on an event; the Python-side sync is the smaller change
+and large-N is a heavyweight call anyway.
