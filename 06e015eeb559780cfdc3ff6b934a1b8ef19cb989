@@ -1,0 +1,37 @@
+perf notes -- mma.m16n8k16 assignment path
+==========================================
+Goal: get the fp16 D=128 iteration under 7 ms (the original Triton kernel
+runs at 7.7 ms/iteration on the same shapes).
+
+Design (src/assign_mma.cuh), block = 64 points (4 warps x 16 rows):
+  1. A operands live in registers for the whole K loop: each lane loads its
+     8 halves per 16-wide d-step once (a[DS][4] u32), so x is never re-read.
+  2. Centroid tiles (BK=32) are copied into padded shared memory with
+     cp.async and double buffered; the padding (row stride D+8 halves) is
+     what makes the per-warp B-fragment access bank-conflict free.
+  3. One __syncthreads per tile: the prefetch for tile i+1 is issued right
+     after the barrier, into the buffer consumed two tiles earlier.
+  4. mma.sync.aligned.m16n8k16.row.col.f32.f16/bf16 per (d-step, n-tile);
+     A fragments stay in registers, B fragments are 2 half2 loads.
+  5. The epilogue never touches shared memory: each lane derives distances
+     from its own accumulator registers (csq - 2*dot suffices, x^2 is
+     constant per row), picks the local best over its 2 columns and reduces
+     across the 4-lane row group with 2 xor-shuffles; the running best and
+     index stay in registers, only lane t==0 stores the final label.
+
+Dispatch: mma (D in {32,64,128,256,512}, fp16/bf16, sm_80+) -> WMMA -> SIMT.
+FK_DISABLE_MMA=1 / FK_DISABLE_WMMA=1 force the fallbacks.
+
+Measured (RTX 5090, B=32 N=74256 K=1000, fp16):
+  D=32  2.8 ms  54 TFLOP/s      D=256  9.0 ms 136 TFLOP/s
+  D=64  3.3 ms  93 TFLOP/s      D=512 21.8 ms 112 TFLOP/s
+  D=128 4.7 ms 129 TFLOP/s
+  batch fp16 D=128: 4.6 ms/iteration (130 TFLOP/s) vs Triton 7.7 ms (79).
+Before this change the same shapes ran at 39/39/35/11 TFLOP/s
+(D=128/256/512: WMMA/SIMT).
+
+Validation: full suite 89 passed / 3 skipped, including new fp16/bf16
+dimension coverage for the mma path and both FK_DISABLE_* fallback runs;
+assignment results match the pure-torch reference after one iteration.
+Known gap: D>512 still falls back to the generic kernels (~0.6 TFLOP/s at
+D=1024); streaming the A operand with ldmatrix is the next step.
