@@ -1,0 +1,16 @@
+test notes -- equivalence suite hardening
+=========================================
+- The reference checkout moved: the repository itself was rewritten, so
+  ``../flash-kmeans`` no longer contains the Triton kernels.  The tests now
+  resolve the reference from ``FLASH_KMEANS_REF_REPO`` or a dedicated
+  sibling checkout (``flash-kmeans-upstream``, created with
+  ``git worktree add ../flash-kmeans-upstream <pre-rewrite commit>``) and
+  validate that ``assign_euclid_triton.py`` really imports triton before
+  using it.
+- The large-N comparison now uses well-separated Gaussian blobs.  With
+  uniform random data every point is a near-tie, so two implementations with
+  different accumulation orders drift apart after two iterations and the
+  label-agreement thresholds were flaky (1-in-3 failures observed).
+- The large-N vs batch test compares the reached objective (inertia) as the
+  primary criterion, with label agreement and the centroid delta as sanity
+  bounds.
