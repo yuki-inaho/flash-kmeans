@@ -1,0 +1,56 @@
+[workspace]
+name = "flash-kmeans"
+description = "Fast batched K-Means clustering (C++/CUDA + nanobind rewrite)"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+# Default environment: build toolchain only.  The nanobind extension itself is
+# torch-free; everything Python-side lives in the `equiv` feature below.
+python = "3.12.*"
+pip = "*"
+cmake = ">=3.28,<4"
+ninja = "*"
+cuda-version = "12.8.*"
+cuda-nvcc = "12.8.*"
+cuda-cudart = "12.8.*"
+cuda-cudart-dev = "12.8.*"
+cuda-cccl = "12.8.*"
+
+[pypi-dependencies]
+nanobind = ">=2.0"
+scikit-build-core = ">=0.10"
+
+[feature.equiv.pypi-dependencies]
+# Optional dependencies: the Python marshalling layer, the functional
+# equivalence checks against the original Triton implementation and the
+# performance regression suite.
+torch = { version = ">=2.7,<3", index = "https://download.pytorch.org/whl/cu128" }
+numpy = ">=1.26"
+pytest = ">=8"
+tqdm = "*"
+triton = ">=3.3"
+
+[environments]
+default = { solve-group = "default" }
+equiv = { features = ["equiv"], solve-group = "default" }
+
+[activation.env]
+# GTX 1070 (sm_61) / Turing / Ampere / RTX 4090 (sm_89) / RTX 5090 (sm_120),
+# plus PTX for forward compatibility.  Override by exporting CUDAARCHS before
+# running the build task if you need other targets.
+CUDAARCHS = "61-real;75-real;86-real;89-real;120-real;120-virtual"
+
+[tasks]
+# Build the nanobind extension and install the package. --no-build-isolation is
+# required because nanobind / scikit-build-core are provided by this pixi env.
+build = "pip install --no-build-isolation --no-deps --force-reinstall ."
+build-editable = "pip install --no-build-isolation --no-deps -e ."
+
+[feature.equiv.tasks]
+# Run with: pixi run -e equiv <task>
+test = "pytest -q tests"
+test-equiv = "pytest -q tests -s"
+bench = "python benchmarks/bench_kmeans.py"
+bench-update = "python benchmarks/bench_kmeans.py --update"
+perf = "FLASH_KMEANS_PERF=1 pytest -q tests/test_perf_regression.py -s"
