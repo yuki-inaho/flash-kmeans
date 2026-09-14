@@ -1,9 +1,9 @@
 {
   "NVIDIA GeForce RTX 5090": {
     "cases": {
-      "assign_fp16_D128": 15.7037,
-      "assign_fp32_D64": 30.5833,
-      "batch_fp16_D128": 15.1478
+      "assign_fp16_D128": 5.098,
+      "assign_fp32_D64": 31.2909,
+      "batch_fp16_D128": 4.5846
     },
     "tolerance": 1.3
   }

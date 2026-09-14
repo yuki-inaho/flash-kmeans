@@ -2,6 +2,7 @@
 // centroid-update entry points.
 #include "flash_kmeans.h"
 #include "kmeans_common.cuh"
+#include "assign_mma.cuh"
 #include "assign_wmma.cuh"
 #include "kmeans_launch.cuh"
 
@@ -156,10 +157,14 @@ int batch_kmeans_typed(const T* x, const T* init_centroids, int* out_labels,
     prof.t_csq += prof.stop(st);
 
     prof.start(st);
-    const bool used_wmma = launch_assign_wmma<T>(
+    const bool used_mma = launch_assign_mma<T>(
         xsrc, xsq.as<float>(), cur.as<T>(), csq.as<float>(), B, N, D, K,
         maximize, out_labels, device, st);
-    if (!used_wmma) {
+    const bool used_wmma =
+        !used_mma && launch_assign_wmma<T>(xsrc, xsq.as<float>(), cur.as<T>(),
+                                           csq.as<float>(), B, N, D, K,
+                                           maximize, out_labels, device, st);
+    if (!used_mma && !used_wmma) {
       launch_to_fp32<T>(cur.as<T>(), cent_f32.as<float>(), rows_c * D, st);
       launch_assign_dispatch<T>(xsrc, xsq.as<float>(), cent_f32.as<float>(),
                                 csq.as<float>(), B, N, D, K, maximize,
@@ -225,10 +230,14 @@ void assign_typed(const T* x, const T* centroids, int* out_labels, std::int64_t 
     csq = DeviceAlloc((std::size_t)B * K * sizeof(float));
     launch_row_sq<T>(centroids, csq.as<float>(), B * K, (int)D, st);
   }
-  const bool used_wmma = launch_assign_wmma<T>(
+  const bool used_mma = launch_assign_mma<T>(
       x, xsq.as<float>(), centroids, csq.as<float>(), B, N, D, K, maximize,
       out_labels, device, st);
-  if (!used_wmma) {
+  const bool used_wmma =
+      !used_mma && launch_assign_wmma<T>(x, xsq.as<float>(), centroids,
+                                         csq.as<float>(), B, N, D, K, maximize,
+                                         out_labels, device, st);
+  if (!used_mma && !used_wmma) {
     DeviceAlloc cent_f32((std::size_t)B * K * D * sizeof(float));
     launch_to_fp32<T>(centroids, cent_f32.as<float>(), (std::size_t)B * K * D,
                       st);

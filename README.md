@@ -83,36 +83,43 @@ iterations (assignment + update + loop overhead):
 
 | implementation                        | ms / iteration | TFLOP/s |
 |---------------------------------------|---------------:|--------:|
-| this rewrite (C++/CUDA, WMMA path)    |           ~15.2 |    40.0 |
-| original Triton (`tl.dot`)            |            7.7  |    79.3 |
+| this rewrite (C++/CUDA, mma path)     |           ~4.6 |   130   |
+| original Triton (`tl.dot`)            |            7.7 |    79.3 |
 
 Assignment-only throughput by feature dimension (same shapes):
 
-| D   | ms     | TFLOP/s | kernel                       |
-|----:|-------:|--------:|------------------------------|
-| 32  |   4.8  |   31.6  | SIMT register tiles          |
-| 64  |   7.9  |   38.5  | SIMT register tiles          |
-| 128 |  15.6  |   38.9  | tensor cores (WMMA)          |
-| 256 |  35.1  |   34.6  | tensor cores (WMMA)          |
-| 512 | 217.7  |   11.2  | SIMT register tiles          |
+| D   | ms     | TFLOP/s | kernel                          |
+|----:|-------:|--------:|---------------------------------|
+| 32  |   2.8  |    54   | tensor cores (mma.m16n8k16)     |
+| 64  |   3.3  |    93   | tensor cores (mma.m16n8k16)     |
+| 128 |   4.7  |   129   | tensor cores (mma.m16n8k16)     |
+| 256 |   9.0  |   136   | tensor cores (mma.m16n8k16)     |
+| 512 |  21.8  |   112   | tensor cores (mma.m16n8k16)     |
 
-Two assignment backends are dispatched automatically:
+Feature dimensions above 512 (and non-instantiated ones) fall back to the
+generic shared-memory kernels, which are much slower (e.g. `D=1024` fp16 runs
+at ~0.6 TFLOP/s); extending the mma design with a D-streamed A operand is the
+natural next step.
 
-* **Tensor cores** (`D % 16 == 0`, fp16/bf16, sm_80+ and the shared-memory
-  budget fits): a 64-point x tile stays in shared memory while the centroid
-  matrix is streamed in double-buffered 32-centroid tiles; each warp computes
-  a 16-point x 32-centroid strip with `mma.m16n16k16` and the epilogue turns
-  the dot products into `||x - c||^2` scores and updates the running argmin.
-* **SIMT register tiles**: the x row is kept in fp32 registers (shared by
-  `SPLIT` lanes per point) and centroid tiles are streamed through padded
-  shared memory with conflict-free bank access.  This path covers every
-  feature dimension up to 512 (rows are zero-padded to a compile-time width,
-  so odd and non-power-of-two `D` are supported) and is also the fast path for
-  fp32 input.
+Three assignment backends are dispatched automatically:
 
-Larger dimensions use a shared-memory tile kernel with a global-memory
-fallback.  `FK_DISABLE_WMMA=1` forces the SIMT path (useful for benchmarking
-and for exercising both backends in the tests).
+* **Tensor cores, hand-written `mma.m16n8k16`** (fp16/bf16, sm_80+, and `D` in
+  `{32, 64, 128, 256, 512}`): each warp owns 16 points whose A operands live in
+  registers for the whole K loop; centroid tiles are staged through padded
+  shared memory with `cp.async` double buffering; the argmin/argmax runs on the
+  accumulator fragments in registers and is reduced across the 4 lanes of each
+  row group.  This is the fastest path and beats the original Triton kernel.
+* **WMMA** (fp16/bf16, `D % 16 == 0`, sm_80+, shared-memory budget fits): a
+  64-point x tile with double-buffered centroid tiles and an in-shared argmin
+  epilogue.  Used for dimensions the mma path does not instantiate.
+* **SIMT register tiles** (fp32, odd/non-power-of-two `D <= 512`, everything
+  else): the x row is kept in fp32 registers (shared by `SPLIT` lanes per
+  point) and centroid tiles stream through padded shared memory with
+  conflict-free bank access.  Larger dimensions use a shared-memory tile
+  kernel with a global-memory fallback.
+
+`FK_DISABLE_MMA=1` / `FK_DISABLE_WMMA=1` force the fallbacks (useful for
+benchmarking, and the test suite exercises both the tensor-core and SIMT paths).
 
 ### Profiling and performance regression tests
 
